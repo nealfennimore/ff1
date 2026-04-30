@@ -203,7 +203,7 @@ def build_html() -> str:
   </div>
 
   <footer>
-    <a href="https://github.com/YOUR_USERNAME/ff1">Source on GitHub</a>
+    <a href="https://github.com/nealfennimore/ff1">Source on GitHub</a>
     &mdash;
     <a href="https://csrc.nist.gov/pubs/sp/800/38/g/upd1/final">NIST SP 800-38G</a>
   </footer>
