@@ -170,3 +170,73 @@ cargo test
 ## License
 
 MIT
+
+---
+
+## WebAssembly
+
+This crate supports compilation to WebAssembly via [wasm-pack](https://rustwasm.github.io/wasm-pack/).
+
+### Prerequisites
+
+```bash
+cargo install wasm-pack
+```
+
+### Build
+
+```bash
+# For browsers (ES module output)
+wasm-pack build --target web
+
+# For Node.js
+wasm-pack build --target nodejs
+
+# For bundlers (webpack, vite, rollup)
+wasm-pack build --target bundler
+```
+
+Output is written to `pkg/`. This directory contains the `.wasm` binary, a JS wrapper, and TypeScript type definitions.
+
+### Usage from JavaScript / TypeScript
+
+```typescript
+import init, { Ff1 } from "./pkg/ff1.js";
+
+// Initialise the WASM module (loads and compiles the .wasm binary)
+await init();
+
+// Create a cipher — key is a hex string, radix is the numeral base
+const cipher = new Ff1("2B7E151628AED2A6ABF7158809CF4F3C", 10);
+
+// Encrypt / decrypt strings
+const ct = cipher.encryptStr("4111111111111111", "merchant-001", Ff1.DIGITS);
+const pt = cipher.decryptStr(ct,                 "merchant-001", Ff1.DIGITS);
+// pt === "4111111111111111"
+
+// Built-in alphabet constants
+Ff1.DIGITS      // "0123456789"
+Ff1.ALPHA_LOWER // "abcdefghijklmnopqrstuvwxyz"
+Ff1.ALPHANUM    // "0123456789abcdefghijklmnopqrstuvwxyz"
+```
+
+### API reference
+
+| Method | Description |
+|---|---|
+| `new Ff1(keyHex, radix, maxTlen?)` | Construct a cipher. `keyHex` is 32/48/64 hex chars. `maxTlen` defaults to 256. |
+| `encryptStr(pt, tweak, alphabet)` | Encrypt a string. Tweak is a UTF-8 string. |
+| `decryptStr(ct, tweak, alphabet)` | Decrypt a string. |
+| `encryptStrHexTweak(pt, tweakHex, alphabet)` | Encrypt with a binary tweak (hex-encoded). |
+| `decryptStrHexTweak(ct, tweakHex, alphabet)` | Decrypt with a binary tweak. |
+| `encrypt(symbols, tweak)` | Encrypt a `Uint32Array` of symbol values. |
+| `decrypt(symbols, tweak)` | Decrypt a `Uint32Array` of symbol values. |
+
+All methods throw a JS `Error` with a descriptive message on invalid input.
+
+### Running WASM tests
+
+```bash
+# Requires Chrome or Firefox to be installed
+wasm-pack test --headless --chrome
+```

@@ -14,5 +14,7 @@ mkShell {
   packages = [
     rustc
     cargo
+    wasm-pack
+    lld
   ];
 }

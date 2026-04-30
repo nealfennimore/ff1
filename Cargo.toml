@@ -1,14 +1,29 @@
 [package]
 name = "ff1"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "FF1 Format-Preserving Encryption (NIST SP 800-38G)"
+description = "FF1 Format-Preserving Encryption (NIST SP 800-38G) — u128 arithmetic"
+
+# cdylib is required for wasm-pack; rlib keeps native `cargo test` working
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
 
 [dependencies]
 aes = "0.8"
 
+# wasm-bindgen is only needed for the WASM target
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
 [dev-dependencies]
-# No extra dev deps needed; tests are inline
+wasm-bindgen-test = "0.3"
+
+# wasm-pack / cargo build --release optimisations
+[profile.release]
+opt-level = "s" # optimise for size — important for WASM bundle size
+lto = true
 
 [[bin]]
 name = "ff1_demo"

@@ -7,6 +7,10 @@
 //   - y = NUM(S) where S is at most 16 bytes: fits in u128 exactly
 //   - We always compute y % modulus before adding, keeping sums < 2^97
 
+// WASM bindings — only compiled when targeting wasm32
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use std::fmt;
