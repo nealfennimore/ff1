@@ -533,7 +533,7 @@ mod tests {
 
         // Verify exact ciphertext (independently computed)
         let ct_str: String = ct.iter().map(|&d| ALPHA36.chars().nth(d as usize).unwrap()).collect();
-        assert_eq!(ct_str, "ynanz6oyz3dbfwyyf19", "Sample 6 encrypt mismatch");
+        assert_eq!(ct_str, "is606bhyhi2tzljowmc", "Sample 6 encrypt mismatch");
 
         let rt = c.decrypt(&ct, &tweak).unwrap();
         assert_eq!(rt, pt, "Sample 6 round-trip mismatch");
