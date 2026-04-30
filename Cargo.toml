@@ -6,8 +6,6 @@ description = "FF1 Format-Preserving Encryption (NIST SP 800-38G)"
 
 [dependencies]
 aes = "0.8"
-num-bigint = "0.4"
-num-traits = "0.2"
 
 [dev-dependencies]
 # No extra dev deps needed; tests are inline
