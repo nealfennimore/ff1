@@ -284,86 +284,37 @@ impl Ff1Cipher {
 mod tests {
     use super::*;
 
-    fn hex_bytes(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
-    }
-    fn digits(s: &str) -> Vec<u32> { s.chars().map(|c| c.to_digit(10).unwrap()).collect() }
-    fn digit_str(v: &[u32]) -> String { v.iter().map(|d| char::from_digit(*d, 10).unwrap()).collect() }
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
 
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Convert a decimal-digit string into a symbol vector (radix-10).
+    fn digits(s: &str) -> Vec<u32> {
+        s.chars().map(|c| c.to_digit(10).unwrap()).collect()
+    }
+
+    /// Turn a symbol vector back into a decimal-digit string (radix-10).
+    fn digit_str(v: &[u32]) -> String {
+        v.iter()
+            .map(|d| char::from_digit(*d, 10).unwrap())
+            .collect()
+    }
+
+    // Alphabet for radix-36 ("0-9 a-z")
     const ALPHA36: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-    #[test]
-    fn nist_sample1_aes128_radix10_no_tweak() {
-        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
-        let pt  = digits("0123456789");
-        let exp = digits("2433477484");
-        let c   = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct  = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(digit_str(&ct), digit_str(&exp), "sample1 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "sample1 decrypt");
-    }
-
-    #[test]
-    fn nist_sample2_aes128_radix10_with_tweak() {
-        let key   = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
-        let tweak = hex_bytes("39383736353433323130");
-        let pt    = digits("0123456789");
-        let exp   = digits("6124200773");
-        let c     = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct    = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(digit_str(&ct), digit_str(&exp), "sample2 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample2 decrypt");
-    }
-
-    #[test]
-    fn nist_sample3_aes128_radix36_with_tweak() {
-        // PDF value "a9tv40mll9kdu509eum" is a known transcription error;
-        // "ynanz6oyz3dbfwyyf19" is verified correct by round-trip.
-        let key   = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
-        let tweak = hex_bytes("3737373770717273373737");
-        let pt: Vec<u32> = (0..19).collect();
-        let c   = Ff1Cipher::new_default(&key, 36).unwrap();
-        let ct  = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct.len(), pt.len());
-        assert!(ct.iter().all(|&d| d < 36));
-        let ct_str: String = ct.iter().map(|&d| ALPHA36.chars().nth(d as usize).unwrap()).collect();
-        assert_eq!(ct_str, "ynanz6oyz3dbfwyyf19", "sample3 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample3 decrypt");
-    }
-
-    #[test]
-    fn nist_sample4_aes256_radix10_no_tweak() {
-        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let pt  = digits("0123456789");
-        let exp = digits("6657667009");
-        let c   = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct  = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(digit_str(&ct), digit_str(&exp), "sample4 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "sample4 decrypt");
-    }
-
-    #[test]
-    fn nist_sample5_aes256_radix10_with_tweak() {
-        let key   = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let tweak = hex_bytes("39383736353433323130");
-        let pt    = digits("0123456789");
-        let exp   = digits("1001623463");
-        let c     = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct    = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(digit_str(&ct), digit_str(&exp), "sample5 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample5 decrypt");
-    }
-
-    #[test]
-    fn nist_sample6_aes256_radix36_with_tweak() {
-        let key   = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let tweak = hex_bytes("3737373770717273373737");
-        let pt: Vec<u32> = (0..19).collect();
-        let c   = Ff1Cipher::new_default(&key, 36).unwrap();
-        let ct  = c.encrypt(&pt, &tweak).unwrap();
-        let ct_str: String = ct.iter().map(|&d| ALPHA36.chars().nth(d as usize).unwrap()).collect();
-        assert_eq!(ct_str, "is606bhyhi2tzljowmc", "sample6 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample6 decrypt");
+    /// Map a radix-36 symbol vector to its string representation.
+    fn r36_str(v: &[u32]) -> String {
+        v.iter()
+            .map(|&d| ALPHA36.chars().nth(d as usize).unwrap())
+            .collect()
     }
 
     #[test]
@@ -467,5 +418,295 @@ mod tests {
     #[test]
     fn error_invalid_radix() {
         assert_eq!(Ff1Cipher::new_default(&[0u8;16], 1), Err(Ff1Error::InvalidRadix(1)));
+    }
+
+    // ---------------------------------------------------------------------------
+    // NIST SP 800-38G sample vectors
+    // (source: https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/FF1samples.pdf)
+    // ---------------------------------------------------------------------------
+
+    // --- AES-128 ---
+    // -------------------------------------------------------------------------
+    // NIST samples 1–3: AES-128
+    // -------------------------------------------------------------------------
+ 
+    #[test]
+    fn nist_sample1_aes128_radix10_no_tweak() {
+        // CT is <2433477484>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![2, 4, 3, 3, 4, 7, 7, 4, 8, 4];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "sample1 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "sample1 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample2_aes128_radix10_with_tweak() {
+        // Tweak = 39 38 37 36 35 34 33 32 31 30; CT is <6124200773>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
+        let tweak = hex_bytes("39383736353433323130");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![6, 1, 2, 4, 2, 0, 0, 7, 7, 3];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample2 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample2 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample3_aes128_radix36_with_tweak() {
+        // Tweak = 37 37 37 37 70 71 72 73 37 37 37; CT is <a9tv40mll9kdu509eum>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
+        let tweak = hex_bytes("3737373770717273373737");
+        let pt: Vec<u32> = (0..19).collect();
+        let expected: Vec<u32> = vec![10, 9, 29, 31, 4, 0, 22, 21, 21, 9, 20, 13, 30, 5, 0, 9, 14, 30, 22];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample3 encrypt");
+        assert_eq!(r36_str(&ct), "a9tv40mll9kdu509eum", "sample3 encrypt string");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample3 decrypt");
+    }
+ 
+    // -------------------------------------------------------------------------
+    // NIST samples 4–6: AES-192
+    // -------------------------------------------------------------------------
+ 
+    #[test]
+    fn nist_sample4_aes192_radix10_no_tweak() {
+        // CT is <2830668132>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![2, 8, 3, 0, 6, 6, 8, 1, 3, 2];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "sample4 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "sample4 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample5_aes192_radix10_with_tweak() {
+        // Tweak = 39 38 37 36 35 34 33 32 31 30; CT is <2496655549>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
+        let tweak = hex_bytes("39383736353433323130");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![2, 4, 9, 6, 6, 5, 5, 5, 4, 9];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample5 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample5 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample6_aes192_radix36_with_tweak() {
+        // Tweak = 37 37 37 37 70 71 72 73 37 37 37; CT is <xbj3kv35jrawxv32ysr>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
+        let tweak = hex_bytes("3737373770717273373737");
+        let pt: Vec<u32> = (0..19).collect();
+        let expected: Vec<u32> = vec![33, 11, 19, 3, 20, 31, 3, 5, 19, 27, 10, 32, 33, 31, 3, 2, 34, 28, 27];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample6 encrypt");
+        assert_eq!(r36_str(&ct), "xbj3kv35jrawxv32ysr", "sample6 encrypt string");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample6 decrypt");
+    }
+ 
+    // -------------------------------------------------------------------------
+    // NIST samples 7–9: AES-256
+    // -------------------------------------------------------------------------
+ 
+    #[test]
+    fn nist_sample7_aes256_radix10_no_tweak() {
+        // CT is <6657667009>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![6, 6, 5, 7, 6, 6, 7, 0, 0, 9];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "sample7 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "sample7 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample8_aes256_radix10_with_tweak() {
+        // Tweak = 39 38 37 36 35 34 33 32 31 30; CT is <1001623463>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let tweak = hex_bytes("39383736353433323130");
+        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected: Vec<u32> = vec![1, 0, 0, 1, 6, 2, 3, 4, 6, 3];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample8 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample8 decrypt");
+    }
+ 
+    #[test]
+    fn nist_sample9_aes256_radix36_with_tweak() {
+        // Tweak = 37 37 37 37 70 71 72 73 37 37 37; CT is <xs8a0azh2avyalyzuwd>
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let tweak = hex_bytes("3737373770717273373737");
+        let pt: Vec<u32> = (0..19).collect();
+        let expected: Vec<u32> = vec![33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13];
+ 
+        let cipher = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "sample9 encrypt");
+        assert_eq!(r36_str(&ct), "xs8a0azh2avyalyzuwd", "sample9 encrypt string");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "sample9 decrypt");
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // CapitalOne long-message vector
+    // (source: https://github.com/capitalone/fpe/blob/master/ff1/ff1_test.go)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn capitalone_aes256_radix36_long_no_tweak() {
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = vec![
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
+            33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21,
+        ];
+        let expected: Vec<u32> = vec![
+            21, 32, 30, 21, 18, 11, 15, 25, 1, 19, 30, 3, 20, 28, 35, 29, 30, 22, 26,
+            24, 22, 32, 14, 23, 25, 31, 7, 13, 30, 34, 9, 26, 7, 25, 16, 7, 35, 15, 3,
+            14, 16, 3, 27, 19, 21, 15, 34, 4, 6, 16, 22, 16, 20, 26, 19, 15, 32, 31,
+            27, 24, 22, 15, 19, 19, 20, 29, 22, 11, 14, 34, 8, 22, 14, 26, 20, 9, 35,
+            20, 12, 22, 16, 31, 20, 31, 4, 28, 9, 21, 21, 5, 12, 29, 24, 35, 22, 14,
+            1, 17, 15, 1, 5, 32, 7, 33, 24, 6, 35, 28, 34, 21, 26, 12, 27, 0, 23, 11,
+            33, 9, 19, 11, 15, 1, 0, 30, 22, 35, 24, 20,
+        ];
+
+        let cipher = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "capitalone long encrypt");
+        assert_eq!(
+            r36_str(&ct),
+            "lwulibfp1ju3ksztumqomwenpv7duy9q7pg7zf3eg3rjlfy46gmgkqjfwvromfjjktmbey8meqk9zkcmgvkv4s9ll5ctozme1hf15w7xo6zsylqcr0nbx9jbf10umzok",
+            "capitalone long encrypt string"
+        );
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "capitalone long decrypt");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Zcash test vectors — radix 2, AES-256
+    // (source: https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/ff1.py)
+    //
+    // Each vector also carries a "binary" representation: the same bit sequence
+    // packed into bytes (big-endian, MSB first). We test both the bit-array form
+    // (direct encrypt/decrypt) and verify the byte interpretation in a comment.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn zcash_1_aes256_radix2_all_zeros_88bits() {
+        // 88 zero bits → known ciphertext
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = vec![0u32; 88];
+        let expected: Vec<u32> = vec![
+            0,0,0,0,1,0,0,1, 0,0,1,1,0,1,0,1, 0,1,1,1,0,1,1,1, 1,1,1,1,1,1,0,0,
+            1,1,0,0,0,0,0,1, 1,0,1,1,0,0,1,1, 1,1,1,0,0,1,1,1, 0,1,1,1,0,1,0,1,
+            0,1,1,0,1,0,1,0, 0,1,0,0,0,1,0,0, 1,1,0,0,1,1,1,1,
+        ];
+        // binary equivalent: pt = [0x00;11], ct = [0x90,0xac,0xee,0x3f,0x83,0xcd,0xe7,0xae,0x56,0x22,0xf3]
+
+        let cipher = Ff1Cipher::new_default(&key, 2).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "zcash_1 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "zcash_1 decrypt");
+    }
+
+    #[test]
+    fn zcash_2_aes256_radix2_round_trip_88bits() {
+        // Encrypt the ciphertext from zcash_1 to get the next vector
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = vec![
+            0,0,0,0,1,0,0,1, 0,0,1,1,0,1,0,1, 0,1,1,1,0,1,1,1, 1,1,1,1,1,1,0,0,
+            1,1,0,0,0,0,0,1, 1,0,1,1,0,0,1,1, 1,1,1,0,0,1,1,1, 0,1,1,1,0,1,0,1,
+            0,1,1,0,1,0,1,0, 0,1,0,0,0,1,0,0, 1,1,0,0,1,1,1,1,
+        ];
+        let expected: Vec<u32> = vec![
+            1,1,0,1,1,0,1,0, 1,1,0,1,0,0,0,1, 1,0,0,0,1,1,1,1, 0,0,0,0,0,1,0,0,
+            1,1,0,0,1,1,1,1, 1,1,0,1,1,0,0,1, 1,1,0,1,0,1,0,1, 1,0,1,0,0,0,0,1,
+            1,1,1,0,0,1,0,0, 0,1,0,1,0,1,1,1, 1,1,0,1,1,0,0,0,
+        ];
+        // binary equivalent: pt = [0x90,0xac,0xee,0x3f,0x83,0xcd,0xe7,0xae,0x56,0x22,0xf3]
+        //                    ct = [0x5b,0x8b,0xf1,0x20,0xf3,0x9b,0xab,0x85,0x27,0xea,0x1b]
+
+        let cipher = Ff1Cipher::new_default(&key, 2).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "zcash_2 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "zcash_2 decrypt");
+    }
+
+    #[test]
+    fn zcash_3_aes256_radix2_alternating_bits_no_tweak() {
+        // Alternating 0101… pattern, 88 bits, no tweak
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = (0..88).map(|i| i % 2).collect(); // 0,1,0,1,...
+        let expected: Vec<u32> = vec![
+            0,0,0,0,1,1,1,1, 0,1,0,0,0,0,0,1, 1,1,1,0,1,1,0,1, 0,1,1,1,0,1,1,1,
+            1,1,1,1,0,0,0,1, 1,0,0,1,0,1,0,0, 0,0,0,0,0,0,1,1, 0,1,1,0,1,1,1,0,
+            1,0,0,0,1,0,0,1, 0,1,1,1,0,0,1,1, 0,0,1,0,0,1,1,0,
+        ];
+        // binary equivalent: pt = [0xaa;11], ct = [0xf0,0x82,0xb7,0xee,0x8f,0x29,0xc0,0x76,0x91,0xce,0x64]
+
+        let cipher = Ff1Cipher::new_default(&key, 2).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "zcash_3 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "zcash_3 decrypt");
+    }
+
+    #[test]
+    fn zcash_4_aes256_radix2_alternating_bits_long_tweak() {
+        // Alternating 0101… pattern, 88 bits, tweak = [0x00, 0x01, …, 0xfe] (255 bytes)
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let tweak: Vec<u8> = (0u8..=254).collect();
+        let pt: Vec<u32> = (0..88).map(|i| i % 2).collect();
+        let expected: Vec<u32> = vec![
+            0,1,1,1,1,1,0,1, 1,0,0,0,1,0,0,0, 0,0,0,1,1,1,0,1, 0,1,1,0,0,0,0,1,
+            0,0,0,1,0,1,0,1, 1,0,1,0,0,0,0,0, 0,0,1,1,1,0,0,1, 1,1,1,0,0,1,0,0,
+            1,0,0,0,1,0,1,0, 1,1,0,1,1,1,1,0, 1,0,1,0,0,0,1,1,
+        ];
+        // binary equivalent: pt = [0xaa;11], ct = [0xbe,0x11,0xb8,0x86,0xa8,0x05,0x9c,0x27,0x51,0x7b,0xc5]
+
+        let cipher = Ff1Cipher::new(&key, 2, 256).unwrap();
+        let ct = cipher.encrypt(&pt, &tweak).unwrap();
+        assert_eq!(ct, expected, "zcash_4 encrypt");
+        assert_eq!(cipher.decrypt(&ct, &tweak).unwrap(), pt, "zcash_4 decrypt");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Additional specific test case — all-zero key, radix 2, 32-bit message
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn specific_aes256_zero_key_radix2_32bits() {
+        // AES-256 all-zero key, 32 zero bits → known ciphertext
+        let key = vec![0u8; 32];
+        let pt: Vec<u32> = vec![0u32; 32];
+        let expected: Vec<u32> = vec![
+            1,1,0,1,1,1,1,0, 1,0,0,1,1,1,1,1, 0,0,1,0,0,0,0,0, 1,1,0,1,1,0,0,0,
+        ];
+        // binary equivalent: pt = [0x00,0x00,0x00,0x00], ct = [0x7b,0xf9,0x04,0x1b]
+
+        let cipher = Ff1Cipher::new_default(&key, 2).unwrap();
+        let ct = cipher.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct, expected, "specific zero-key encrypt");
+        assert_eq!(cipher.decrypt(&ct, &[]).unwrap(), pt, "specific zero-key decrypt");
     }
 }
