@@ -28,14 +28,14 @@ FF1 is the more capable of the two original NIST FPE schemes (alongside FF3/FF3-
 
 FF1 is a 10-round Feistel cipher. Each round:
 
-1. Splits the input numeral string into two halves A (length `u`) and B (length `v`)
+1. Splits the input numeral string into two halves A (length `u = floor(n/2)`) and B (length `v = n - u`)
 2. Builds a fixed 16-byte header block P encoding the radix, lengths, and tweak length
 3. Builds a variable Q block containing the tweak, a round counter, and `NUMradix(B)` masked to `b` bytes
 4. Computes `R = PRF(P || Q)` via **CBC-MAC** (AES-ECB chained over the full P||Q input)
 5. Expands R into `d` bytes of keystream using counter mode: `S = R || AES(R⊕1) || ...`
 6. Updates A as `C = (NUMradix(A) + NUM(S)) mod radix^m`, then swaps halves
 
-The underlying cipher is **AES-ECB**, used both for the CBC-MAC chain and the keystream expansion. This is appropriate because FPE requires a keyed pseudorandom permutation on a fixed 128-bit input — the Feistel structure provides the security guarantees.
+The underlying cipher is **AES-ECB**, used both for the CBC-MAC chain and the keystream expansion.
 
 ### Key parameters
 
@@ -46,7 +46,7 @@ The underlying cipher is **AES-ECB**, used both for the CBC-MAC chain and the ke
 | Supported key sizes | 128, 192, 256 bits |
 | Radix range | 2 – 65536 |
 | Min plaintext length | 2 symbols |
-| Max plaintext length | `2 * floor(96 / log2(radix))` |
+| Max plaintext length | `2^32 - 1` symbols (NIST SP 800-38G §5.2) |
 
 ### FF1 vs FF3-1
 
@@ -62,21 +62,37 @@ The underlying cipher is **AES-ECB**, used both for the CBC-MAC chain and the ke
 
 ## Implementation notes
 
-All intermediate arithmetic uses **`u128`** rather than arbitrary-precision integers. This is safe because the NIST spec requires `radix^n < 2^96` for valid inputs — a constraint already enforced by the length check — meaning all intermediate values fit within 128 bits. The keystream value `y = NUM(S)` is at most `2^128 - 1` (a full 16-byte S block), which fits exactly in a `u128`. We always reduce `y % modulus` before adding, keeping all sums below `2^97`.
+### Arithmetic
 
-This design avoids heap allocation in the hot path entirely, producing significantly better throughput than BigInt-based alternatives.
+Intermediate values — `NUMradix(A/B)`, `modulus = radix^m`, and the Feistel accumulator — are computed using one of two paths chosen automatically at runtime:
+
+**u128 fast path** — used when `radix^max(u,v) < 2^128`. This covers essentially all common usage: radix 10 up to ~76 symbols, radix 36 up to ~48 symbols, radix 2 up to 256 symbols. No heap allocation in the hot path.
+
+**BigUint path** — engaged automatically for longer inputs where intermediate values would overflow `u128`. The switch is transparent; no configuration is needed.
+
+The crossover point per radix:
+
+| radix | max n on u128 path | BigUint required above |
+|------:|-------------------:|-----------------------:|
+| 2     | 256                | 257                    |
+| 10    | 76                 | 77                     |
+| 36    | 48                 | 49                     |
+| 65536 | 16                 | 17                     |
+
+`y = NUM(S[0..d])` is derived from at most one 16-byte AES block and always fits in `u128`, so `num-bigint` is only pulled in for `NUMradix`, `pow`, and `str_m_radix` on the large path.
+
+### Cargo.toml dependencies
+
+```toml
+[dependencies]
+aes          = "0.8"
+num-bigint   = "0.4"
+num-traits   = "0.4"
+```
 
 ---
 
 ## Usage
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-ff1 = { path = "." }
-aes = "0.8"
-```
 
 ### Numeric symbols (radix 10)
 
@@ -84,12 +100,11 @@ aes = "0.8"
 use ff1::Ff1Cipher;
 
 let key   = hex::decode("2B7E151628AED2A6ABF7158809CF4F3C").unwrap();
-let tweak = b"my-record-id"; // variable length, up to max_tlen bytes
+let tweak = b"my-record-id";
 
 let cipher = Ff1Cipher::new_default(&key, 10)?;
 
-// Encrypt a Vec<u32> of digit symbols
-let plaintext  = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+let plaintext  = vec![0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 let ciphertext = cipher.encrypt(&plaintext, tweak)?;
 let recovered  = cipher.decrypt(&ciphertext, tweak)?;
 
@@ -102,7 +117,6 @@ assert_eq!(recovered, plaintext);
 let cipher   = Ff1Cipher::new_default(&key, 10)?;
 let alphabet = "0123456789";
 
-// Credit card tokenisation
 let ccn       = "4111111111111111";
 let encrypted = cipher.encrypt_str(ccn, b"merchant-001", alphabet)?;
 let decrypted = cipher.decrypt_str(&encrypted, b"merchant-001", alphabet)?;
@@ -121,35 +135,37 @@ let ct = cipher.encrypt_str("secretmessage", b"context", alpha)?;
 // ct is another lowercase string of the same length
 ```
 
+### Long inputs (BigUint path)
+
+Long inputs are handled automatically — no API change required:
+
+```rust
+// radix=36, 128 symbols: requires BigUint (36^64 > 2^128)
+let cipher = Ff1Cipher::new_default(&key, 36)?;
+let pt: Vec<u32> = (0..128).map(|i| i % 36).collect();
+let ct = cipher.encrypt(&pt, &[])?;
+assert_eq!(cipher.decrypt(&ct, &[])?, pt);
+```
+
 ### Custom max tweak length
 
 ```rust
-// Restrict tweak to 32 bytes maximum
 let cipher = Ff1Cipher::new(&key, 10, 32)?;
-```
-
-### Empty tweak
-
-```rust
-// Tweak is optional — an empty tweak is valid
-let ct = cipher.encrypt(&plaintext, &[])?;
 ```
 
 ---
 
 ## Test vectors
 
-Tests include:
+Tests cover:
 
-- **All 6 NIST SP 800-38G Appendix C sample vectors** — samples 1, 2, 4, and 5 match published ciphertext values exactly; samples 3 and 6 (radix=36) are verified by round-trip (see note below)
-- Round-trip correctness for radix-2, radix-10, radix-26, SSN-style, and credit card fields
-- Empty tweak and non-empty tweak producing different outputs
+- **All 9 NIST SP 800-38G sample vectors** (samples 1–9, AES-128/192/256, radix 10 and 36) verified against the [official NIST PDF](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/FF1samples.pdf)
+- **4 Zcash FF1 radix-2 vectors** from the [zcash-test-vectors](https://github.com/zcash-hackworks/zcash-test-vectors) reference implementation, including an 88-bit input with a 255-byte tweak
+- **All-zero AES-256 key** with radix-2 32-bit input
+- **BigUint path coverage**: boundary crossover (n=49), odd-length input (n=127), and non-empty tweak on the BigUint path
+- **CapitalOne long round-trip**: 128-symbol radix-36 input (ported from [capitalone/fpe TestLong](https://github.com/capitalone/fpe/blob/master/ff1/ff1_test.go))
+- **Minimum length** (n=2): exhaustive test over all 100 two-digit radix-10 inputs
 - Error handling: bad key length, tweak too long, short plaintext, out-of-range symbols, invalid radix
-- Determinism checks
-
-> **Note on radix=36 sample vectors:** The ciphertext values in the NIST samples PDF for samples 3 and 6 (`a9tv40mll9kdu509eum` and `xbj3kv35jrawxv32ysr`) appear to be transcription errors — decrypting them does not recover the original plaintext under any interpretation of the algorithm. Our implementation produces values that round-trip correctly and match independent Python reference implementations.
-
-Run the tests:
 
 ```bash
 cargo test
@@ -159,11 +175,11 @@ cargo test
 
 ## Security considerations
 
-- **Tweak**: FF1's variable-length tweak is one of its main advantages. Binding the tweak to a record identifier, table name, or tenant ID means the same plaintext encrypts differently in different contexts, preventing cross-context correlation even if the key is shared.
-- **Domain size**: The NIST Rev 1 draft requires `radix^n >= 1,000,000`. Short inputs over small alphabets (e.g. 4-digit PINs in radix 10: `10^4 = 10,000`) do not meet this threshold and provide weak security.
-- **Key management**: Treat the AES key with the same care as any symmetric encryption key. Compromise of the key allows full decryption of all tokenised values.
-- **Not authenticated encryption**: FF1 provides confidentiality but not integrity or authenticity. A ciphertext can be modified without detection. If integrity matters, layer an authenticated scheme on top.
-- **Performance**: FF1 makes more AES calls per round than FF3-1 (CBC-MAC over P||Q rather than a single block). For high-throughput batch tokenisation, consider FF3-1 if the fixed 7-byte tweak is acceptable for your use case.
+- **Tweak**: Bind the tweak to a record identifier, table name, or tenant ID so the same plaintext encrypts differently in different contexts, preventing cross-context correlation.
+- **Domain size**: NIST Rev 1 requires `radix^n >= 1,000,000`. Short inputs over small alphabets (e.g. 4-digit PINs: `10^4 = 10,000`) do not meet this threshold and provide weak security.
+- **Key management**: Treat the AES key with the same care as any symmetric key. Compromise allows full decryption of all tokenised values.
+- **Not authenticated encryption**: FF1 provides confidentiality but not integrity or authenticity. A ciphertext can be modified without detection. Layer an authenticated scheme on top if integrity matters.
+- **Performance**: FF1 makes more AES calls per round than FF3-1. For high-throughput batch tokenisation with a fixed 7-byte tweak, FF3-1 may be preferable.
 
 ---
 
@@ -203,13 +219,10 @@ Output is written to `pkg/`. This directory contains the `.wasm` binary, a JS wr
 ```typescript
 import init, { Ff1 } from "./pkg/ff1.js";
 
-// Initialise the WASM module (loads and compiles the .wasm binary)
 await init();
 
-// Create a cipher — key is a hex string, radix is the numeral base
 const cipher = new Ff1("2B7E151628AED2A6ABF7158809CF4F3C", 10);
 
-// Encrypt / decrypt strings
 const ct = cipher.encryptStr("4111111111111111", "merchant-001", Ff1.DIGITS);
 const pt = cipher.decryptStr(ct,                 "merchant-001", Ff1.DIGITS);
 // pt === "4111111111111111"
@@ -237,6 +250,5 @@ All methods throw a JS `Error` with a descriptive message on invalid input.
 ### Running WASM tests
 
 ```bash
-# Requires Chrome or Firefox to be installed
 wasm-pack test --headless --chrome
 ```
