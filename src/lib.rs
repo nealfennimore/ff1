@@ -143,7 +143,7 @@ impl Ff1Cipher {
 
     fn cipher_core(&self, x: &[u32], tweak: &[u8], encrypt: bool) -> Vec<u32> {
         let n = x.len();
-        let u = (n + 1) / 2;
+        let u = n / 2;
         let v = n - u;
         let radix = self.radix as u128;
 
