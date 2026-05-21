@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 aes = "0.8"
+num-bigint = "0.4"
+num-traits = "0.2.19"
 
 # wasm-bindgen is only needed for the WASM target
 [target.'cfg(target_arch = "wasm32")'.dependencies]

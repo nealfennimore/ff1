@@ -16,5 +16,6 @@ mkShell {
     cargo
     wasm-pack
     lld
+    rustfmt
   ];
 }
