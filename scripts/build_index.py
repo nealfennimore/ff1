@@ -108,8 +108,46 @@ def build_html() -> str:
       font-family: inherit;
     }
     input:focus, select:focus { outline: none; border-color: var(--accent); }
+    .tweak-row { display: flex; gap: 8px; align-items: flex-end; }
+    .tweak-row input { flex: 1; }
+    .tweak-toggle {
+      flex: none;
+      padding: 7px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .tweak-toggle.hex { border-color: var(--accent); color: var(--accent); }
+    .tweak-hint {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 0.25rem;
+    }
+    .nist-row {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 0.5rem;
+    }
+    .nist-btn {
+      font-size: 0.72rem;
+      padding: 4px 8px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .nist-btn:hover { border-color: var(--accent); color: var(--accent); }
     .btn-row { display: flex; gap: 8px; margin-top: 1rem; }
-    button {
+    button.btn-enc, button.btn-dec {
       flex: 1;
       padding: 9px;
       border: none;
@@ -184,8 +222,15 @@ def build_html() -> str:
     <label>Alphabet</label>
     <input id="alphabet" value="0123456789" spellcheck="false">
 
-    <label>Tweak (UTF-8 string, variable length)</label>
-    <input id="tweak" value="merchant-001">
+    <label>Tweak</label>
+    <div class="tweak-row">
+      <input id="tweak" value="merchant-001" spellcheck="false">
+      <button class="tweak-toggle" id="tweak-toggle" onclick="toggleTweakMode()" title="Switch between UTF-8 string and hex bytes">UTF-8</button>
+    </div>
+    <div class="tweak-hint" id="tweak-hint">Tweak is interpreted as a UTF-8 string.</div>
+
+    <label style="margin-top:1rem">NIST sample vectors</label>
+    <div class="nist-row" id="nist-row"></div>
 
     <label>Plaintext / Ciphertext</label>
     <input id="pt" value="4111111111111111" spellcheck="false">
@@ -216,7 +261,21 @@ def build_html() -> str:
     "36": "0123456789abcdefghijklmnopqrstuvwxyz",
   };
 
+  // NIST sample vectors (tweaks are hex-encoded)
+  const NIST_VECTORS = [
+    { label: "S1 AES-128 r10", key: "2B7E151628AED2A6ABF7158809CF4F3C",                                 radix: 10, tweakHex: "",                       pt: "0123456789",          ct: "2433477484" },
+    { label: "S2 AES-128 r10", key: "2B7E151628AED2A6ABF7158809CF4F3C",                                 radix: 10, tweakHex: "39383736353433323130",     pt: "0123456789",          ct: "6124200773" },
+    { label: "S3 AES-128 r36", key: "2B7E151628AED2A6ABF7158809CF4F3C",                                 radix: 36, tweakHex: "3737373770717273373737",   pt: "0123456789abcdefghi", ct: "a9tv40mll9kdu509eum" },
+    { label: "S4 AES-192 r10", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F",                 radix: 10, tweakHex: "",                       pt: "0123456789",          ct: "2830668132" },
+    { label: "S5 AES-192 r10", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F",                 radix: 10, tweakHex: "39383736353433323130",     pt: "0123456789",          ct: "2496655549" },
+    { label: "S6 AES-192 r36", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F",                 radix: 36, tweakHex: "3737373770717273373737",   pt: "0123456789abcdefghi", ct: "xbj3kv35jrawxv32ysr" },
+    { label: "S7 AES-256 r10", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94", radix: 10, tweakHex: "",                       pt: "0123456789",          ct: "6657667009" },
+    { label: "S8 AES-256 r10", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94", radix: 10, tweakHex: "39383736353433323130",     pt: "0123456789",          ct: "1001623463" },
+    { label: "S9 AES-256 r36", key: "2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94", radix: 36, tweakHex: "3737373770717273373737",   pt: "0123456789abcdefghi", ct: "xs8a0azh2avyalyzuwd" },
+  ];
+
   let Ff1Cls = null;
+  let tweakIsHex = false;
 
   function log(msg, type = "info") {
     const el = document.getElementById("log");
@@ -239,6 +298,39 @@ def build_html() -> str:
     document.getElementById("alphabet").value = ALPHABETS[r] ?? "";
   };
 
+  window.toggleTweakMode = () => {
+    tweakIsHex = !tweakIsHex;
+    const btn  = document.getElementById("tweak-toggle");
+    const hint = document.getElementById("tweak-hint");
+    btn.textContent = tweakIsHex ? "Hex" : "UTF-8";
+    btn.classList.toggle("hex", tweakIsHex);
+    hint.textContent = tweakIsHex
+      ? "Tweak is interpreted as hex-encoded bytes (e.g. 39383736353433323130)."
+      : "Tweak is interpreted as a UTF-8 string.";
+  };
+
+  window.loadNist = (v) => {
+    document.getElementById("key").value     = v.key;
+    document.getElementById("radix").value   = String(v.radix);
+    document.getElementById("alphabet").value = ALPHABETS[String(v.radix)] ?? "";
+    document.getElementById("tweak").value   = v.tweakHex;
+    document.getElementById("pt").value      = v.pt;
+    // NIST tweaks are always hex
+    if (!tweakIsHex) window.toggleTweakMode();
+    setResult(`Expected ciphertext: ${v.ct}`, "info");
+    log(`Loaded ${v.label} — click Encrypt to verify`, "info");
+  };
+
+  // Build NIST vector buttons
+  const row = document.getElementById("nist-row");
+  NIST_VECTORS.forEach(v => {
+    const btn = document.createElement("button");
+    btn.className = "nist-btn";
+    btn.textContent = v.label;
+    btn.onclick = () => window.loadNist(v);
+    row.appendChild(btn);
+  });
+
   try {
     const m = await import("./pkg/ff1.js");
     await m.default();
@@ -260,9 +352,11 @@ def build_html() -> str:
       const input = document.getElementById("pt").value.trim();
       const tweak = document.getElementById("tweak").value;
       const alpha = document.getElementById("alphabet").value;
-      const out   = dir === "encrypt"
-        ? cipher.encryptStr(input, tweak, alpha)
-        : cipher.decryptStr(input, tweak, alpha);
+      const out = dir === "encrypt"
+        ? (tweakIsHex ? cipher.encryptStrHexTweak(input, tweak, alpha)
+                      : cipher.encryptStr(input, tweak, alpha))
+        : (tweakIsHex ? cipher.decryptStrHexTweak(input, tweak, alpha)
+                      : cipher.decryptStr(input, tweak, alpha));
       setResult(out, "ok");
       document.getElementById("pt").value = out;
       log(`${dir}: "${input}" → "${out}"`, "ok");
