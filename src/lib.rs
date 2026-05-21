@@ -648,6 +648,72 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // BigUint path boundary and coverage tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bigint_boundary_first_crossover_n49_radix36() {
+        // n=49 is the first radix-36 length that requires BigUint:
+        // max(u,v) = 25, and 25 * log2(36) = 129.25 bits > 128.
+        // n=48 (u=v=24, 124 bits) still fits u128; this is the crossover.
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = (0..49).map(|i| i % 36).collect();
+        let c = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = c.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct.len(), 49);
+        assert!(ct.iter().all(|&d| d < 36));
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
+    }
+
+    #[test]
+    fn bigint_odd_length_n127_radix36() {
+        // Odd n gives u=63, v=64, so even rounds use m=63 and odd rounds m=64.
+        // This exercises both modulus sizes and asymmetric biguint_to_be_bytes_fixed
+        // serialization on the BigInt path — not covered by the even-n=128 test.
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let pt: Vec<u32> = (0..127).map(|i| i % 36).collect();
+        let c = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct = c.encrypt(&pt, &[]).unwrap();
+        assert_eq!(ct.len(), 127);
+        assert!(ct.iter().all(|&d| d < 36));
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
+    }
+
+    #[test]
+    fn bigint_with_tweak_n128_radix36() {
+        // All BigInt tests so far use an empty tweak. Verify the tweak bytes
+        // are correctly included in PQ on the BigInt path.
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let tweak = hex_bytes("39383736353433323130");
+        let pt: Vec<u32> = (0..128).map(|i| i % 36).collect();
+        let c = Ff1Cipher::new_default(&key, 36).unwrap();
+        let ct_with = c.encrypt(&pt, &tweak).unwrap();
+        let ct_without = c.encrypt(&pt, &[]).unwrap();
+        // tweak must change the output
+        assert_ne!(ct_with, ct_without);
+        assert_eq!(ct_with.len(), 128);
+        assert!(ct_with.iter().all(|&d| d < 36));
+        assert_eq!(c.decrypt(&ct_with, &tweak).unwrap(), pt);
+    }
+
+    #[test]
+    fn minimum_length_n2_radix10() {
+        // n=2 is the minimum permitted length. Exercises the edge of the Feistel
+        // where u=1, v=1, and each half is a single symbol.
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
+        let c = Ff1Cipher::new_default(&key, 10).unwrap();
+        for first in 0u32..10 {
+            for second in 0u32..10 {
+                let pt = vec![first, second];
+                let ct = c.encrypt(&pt, &[]).unwrap();
+                assert_eq!(ct.len(), 2);
+                assert!(ct.iter().all(|&d| d < 10));
+                assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Zcash test vectors — radix 2, AES-256
     // -------------------------------------------------------------------------
 
