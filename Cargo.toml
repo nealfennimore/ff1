@@ -1,6 +1,6 @@
 [package]
 name = "ff1"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "FF1 Format-Preserving Encryption (NIST SP 800-38G) — u128 arithmetic"
 
