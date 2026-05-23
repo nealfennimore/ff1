@@ -230,6 +230,10 @@ impl Ff1Cipher {
     }
 
     /// Compute y = NUM(S[0..d]) for one Feistel round.
+    /// Writes S = R || AES_K(R XOR [1]) || AES_K(R XOR [2]) || ... truncated to d bytes
+    /// into `s_out`. Spec: NIST SP 800-38G Algorithm 5, step 6.ii–6.iv.
+    /// `s_out` is resized to exactly `d` bytes. The caller interprets it via
+    /// NUM(S) in the appropriate numeric domain (u128 or BigUint).
     fn compute_y(
         &self,
         p_block: &[u8; 16],
@@ -239,7 +243,8 @@ impl Ff1Cipher {
         d: usize,
         i: usize,
         num_half_bytes: &[u8],
-    ) -> u128 {
+        s_out: &mut Vec<u8>,
+    ) {
         let t = tweak.len();
         let pad_len = (-(t as isize) - blen as isize - 1).rem_euclid(16) as usize;
 
@@ -262,26 +267,26 @@ impl Ff1Cipher {
 
         let r_block = self.prf(pq);
 
-        let mut s_bytes = [0u8; 32];
-        s_bytes[..16].copy_from_slice(&r_block);
-
-        let num_extra = (d + 15) / 16 - 1;
-        for j in 1..=num_extra {
+        // Build S = R || AES_K(R XOR [1]) || AES_K(R XOR [2]) || ...
+        // sized to ceil(d/16) * 16 bytes, then truncated to d.
+        // The previous implementation used a fixed [u8; 32] buffer and unconditionally
+        // wrote each extra block to s_bytes[16..32], which (a) overwrote earlier extra
+        // blocks for d > 32, and (b) was followed by code that ignored s_bytes[16..]
+        // entirely when reading y. Both bugs are fixed here.
+        let total_blocks = (d + 15) / 16;
+        s_out.clear();
+        s_out.reserve(total_blocks * 16);
+        s_out.extend_from_slice(&r_block);
+        for j in 1..total_blocks {
             let mut xored = r_block;
             xored[12] ^= ((j >> 24) & 0xFF) as u8;
             xored[13] ^= ((j >> 16) & 0xFF) as u8;
             xored[14] ^= ((j >> 8) & 0xFF) as u8;
             xored[15] ^= (j & 0xFF) as u8;
             self.cipher.encrypt_block(&mut xored);
-            s_bytes[16..32].copy_from_slice(&xored);
+            s_out.extend_from_slice(&xored);
         }
-
-        if d <= 16 {
-            let shift = (16 - d) * 8;
-            u128::from_be_bytes(s_bytes[..16].try_into().unwrap()) >> shift
-        } else {
-            u128::from_be_bytes(s_bytes[..16].try_into().unwrap())
-        }
+        s_out.truncate(d);
     }
 
     pub fn encrypt(&self, plaintext: &[u32], tweak: &[u8]) -> Result<Vec<u32>, Ff1Error> {
@@ -345,6 +350,9 @@ impl Ff1Cipher {
         // Reusable scratch buffer for str_m_radix output — avoids allocation per round
         let mut scratch: Vec<u32> = Vec::with_capacity(v.max(u));
 
+        // Reusable buffer for S (the d-byte PRF output stream from compute_y)
+        let mut s_buf: Vec<u8> = Vec::with_capacity((d + 15) & !15);
+
         if self.fits_u128(u.max(v)) {
             // ---- Fast path: pure u128 ----
             let radix = self.radix as u128;
@@ -365,21 +373,44 @@ impl Ff1Cipher {
                     let num_half_be = num_half.to_be_bytes();
                     let num_half_bytes = &num_half_be[16 - blen..];
 
-                    let y = self.compute_y(&p_block, &mut pq, tweak, blen, d, $i, num_half_bytes);
+                    self.compute_y(
+                        &p_block,
+                        &mut pq,
+                        tweak,
+                        blen,
+                        d,
+                        $i,
+                        num_half_bytes,
+                        &mut s_buf,
+                    );
+                    // y = NUM(S) mod radix^m. When d <= 16, the full S fits in a u128.
+                    // When d > 16 (possible even in the u128 path, since d can reach 20),
+                    // reduce via BigUint first; the result fits in u128 because
+                    // modulus = radix^m < 2^128 in this branch.
+                    let y_mod_modulus: u128 = if d <= 16 {
+                        let mut buf = [0u8; 16];
+                        buf[16 - d..].copy_from_slice(&s_buf);
+                        u128::from_be_bytes(buf) % modulus
+                    } else {
+                        let y_big = BigUint::from_bytes_be(&s_buf);
+                        let m_big = BigUint::from(modulus);
+                        (y_big % m_big)
+                            .to_u128()
+                            .expect("y mod (modulus < 2^128) fits in u128")
+                    };
 
                     if encrypt {
                         let num_a = num_radix_u128(radix, &a);
-                        let c = (num_a + y % modulus) % modulus;
+                        let c = (num_a + y_mod_modulus) % modulus;
                         fill_str_m_radix_u128(radix, &mut scratch, m, c);
                         std::mem::swap(&mut a, &mut b);
                         std::mem::swap(&mut b, &mut scratch);
                     } else {
                         let num_b = num_radix_u128(radix, &b);
-                        let y_mod = y % modulus;
-                        let c = if num_b >= y_mod {
-                            num_b - y_mod
+                        let c = if num_b >= y_mod_modulus {
+                            num_b - y_mod_modulus
                         } else {
-                            modulus - (y_mod - num_b)
+                            modulus - (y_mod_modulus - num_b)
                         };
                         fill_str_m_radix_u128(radix, &mut scratch, m, c);
                         std::mem::swap(&mut b, &mut a);
@@ -424,9 +455,17 @@ impl Ff1Cipher {
                     let num_half = num_radix_big(&radix, half);
                     let num_half_bytes = biguint_to_be_bytes_fixed(&num_half, blen);
 
-                    let y_u128 =
-                        self.compute_y(&p_block, &mut pq, tweak, blen, d, $i, &num_half_bytes);
-                    let y = BigUint::from(y_u128);
+                    self.compute_y(
+                        &p_block,
+                        &mut pq,
+                        tweak,
+                        blen,
+                        d,
+                        $i,
+                        &num_half_bytes,
+                        &mut s_buf,
+                    );
+                    let y = BigUint::from_bytes_be(&s_buf);
 
                     if encrypt {
                         let num_a = num_radix_big(&radix, &a);
@@ -898,5 +937,71 @@ mod tests {
         let pt = digits("0123456789");
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
         assert_ne!(c.encrypt(&pt, &[]).unwrap(), c.encrypt(&pt, b"t").unwrap());
+    }
+
+    /// Regression test for the structural-leak bug.
+    ///
+    /// Before the compute_y fix, encrypting six repetitions of the canonical
+    /// test PAN "4111111111111111" with the NIST test key produced a
+    /// ciphertext where both 48-digit halves began with "411111111" —
+    /// nine plaintext digits visible in the output of each half. The cause:
+    /// compute_y truncated S to its first 16 bytes when d > 16, dropping
+    /// 12 bytes of PRF output per Feistel round (here d = 28). With only
+    /// 128 bits of mixing entering a half that holds ~159 bits of state,
+    /// the high-order ~10 digits passed through largely unchanged.
+    ///
+    /// The fix reads the full d-byte S. This test pins the corrected
+    /// ciphertext and asserts the absence of any shared prefix with the
+    /// plaintext halves.
+    #[test]
+    fn regression_repeated_pan_no_structural_leak() {
+        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
+        let pt_str = "411111111111111141111111111111114111111111111111\
+                  411111111111111141111111111111114111111111111111";
+        let pt: Vec<u32> = pt_str.chars().map(|c| c.to_digit(10).unwrap()).collect();
+        assert_eq!(pt.len(), 96);
+
+        let c = Ff1Cipher::new_default(&key, 10).unwrap();
+        let ct = c.encrypt(&pt, &[]).unwrap();
+        let ct_str: String = ct
+            .iter()
+            .map(|&d| char::from_digit(d, 10).unwrap())
+            .collect();
+
+        // Pinned ciphertext (regression value). If compute_y is ever
+        // re-broken to drop high-order bytes of S, this assertion fails.
+        assert_eq!(
+            ct_str,
+            "703119137348912971661556488062891702538371672565\
+         150501264562680003430530435589492569181388595292"
+        );
+
+        // Round-trip.
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
+
+        // Structural-leak guard. Each 48-digit half of the plaintext is
+        // identical and starts with "411111111111111" (15 leading digits
+        // before the first non-repeating digit). The buggy implementation
+        // leaked 9 of these into both ciphertext halves. After the fix,
+        // neither ciphertext half should share even the first digit with
+        // the plaintext half — and certainly not nine.
+        let pt_half_prefix = &pt_str[..15]; // "411111111111111"
+        let ct_half_1 = &ct_str[..48];
+        let ct_half_2 = &ct_str[48..];
+        for half in [ct_half_1, ct_half_2] {
+            let shared = half
+                .chars()
+                .zip(pt_half_prefix.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            assert!(
+                shared < 4,
+                "ciphertext half {:?} shares {} leading digits with plaintext \
+             half {:?} — structural leak regression",
+                half,
+                shared,
+                pt_half_prefix
+            );
+        }
     }
 }
