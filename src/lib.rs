@@ -1,15 +1,14 @@
 // FF1 Format-Preserving Encryption
 // Implements NIST SP 800-38G
 //
-// Arithmetic strategy:
-// - Fast path (u128): used when radix^max(u,v) < 2^128, covering all NIST
-//   sample inputs and most real-world usage.
-// - BigUint path: engaged automatically when the plaintext is long enough that
-//   NUMradix values would overflow u128 (e.g. radix=36, n=128).
-//   y = NUM(S[0..d]) always fits in u128 (S is at most 16 AES bytes), so only
-//   num_radix, pow, modulus, and str_m_radix need BigUint on the large path.
+// Performance optimisations over the original:
+//   1. AES key schedule expanded once in Ff1Cipher::new, not per AES call
+//   2. iter_range Vec allocation eliminated — direct loop over range
+//   3. encrypt_str/decrypt_str use a HashMap for O(1) symbol lookup
+//   4. pq zero-padding uses resize() instead of extend(repeat())
+//   5. str_m_radix writes into an existing Vec to avoid per-round allocation
+//   6. a/b Vecs pre-allocated and reused across Feistel rounds
 
-// WASM bindings — only compiled when targeting wasm32
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
@@ -18,6 +17,7 @@ use aes::{Aes128, Aes192, Aes256};
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use num_traits::identities::Zero;
+use std::collections::HashMap;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -54,27 +54,34 @@ impl fmt::Display for Ff1Error {
 }
 
 // ---------------------------------------------------------------------------
-// AES-ECB single-block encrypt
+// Pre-expanded AES cipher — key schedule computed once at construction
 // ---------------------------------------------------------------------------
 
-fn aes_ecb(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
-    let mut out = *block;
-    match key.len() {
-        16 => {
-            let c = Aes128::new_from_slice(key).unwrap();
-            c.encrypt_block(aes::Block::from_mut_slice(&mut out));
+enum AesCipher {
+    Aes128(Aes128),
+    Aes192(Aes192),
+    Aes256(Aes256),
+}
+
+impl AesCipher {
+    fn new(key: &[u8]) -> Result<Self, Ff1Error> {
+        match key.len() {
+            16 => Ok(AesCipher::Aes128(Aes128::new_from_slice(key).unwrap())),
+            24 => Ok(AesCipher::Aes192(Aes192::new_from_slice(key).unwrap())),
+            32 => Ok(AesCipher::Aes256(Aes256::new_from_slice(key).unwrap())),
+            n => Err(Ff1Error::InvalidKeyLength(n)),
         }
-        24 => {
-            let c = Aes192::new_from_slice(key).unwrap();
-            c.encrypt_block(aes::Block::from_mut_slice(&mut out));
-        }
-        32 => {
-            let c = Aes256::new_from_slice(key).unwrap();
-            c.encrypt_block(aes::Block::from_mut_slice(&mut out));
-        }
-        _ => panic!("Unexpected key length"),
     }
-    out
+
+    #[inline]
+    fn encrypt_block(&self, block: &mut [u8; 16]) {
+        let b = aes::Block::from_mut_slice(block);
+        match self {
+            AesCipher::Aes128(c) => c.encrypt_block(b),
+            AesCipher::Aes192(c) => c.encrypt_block(b),
+            AesCipher::Aes256(c) => c.encrypt_block(b),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,14 +93,15 @@ fn num_radix_u128(radix: u128, x: &[u32]) -> u128 {
     x.iter().fold(0u128, |acc, &d| acc * radix + d as u128)
 }
 
+/// Writes the base-radix representation of `x` into `out`, resizing to `m`.
+/// Reuses the existing allocation to avoid a Vec allocation per Feistel round.
 #[inline]
-fn str_m_radix_u128(radix: u128, m: usize, mut x: u128) -> Vec<u32> {
-    let mut digits = vec![0u32; m];
+fn fill_str_m_radix_u128(radix: u128, out: &mut Vec<u32>, m: usize, mut x: u128) {
+    out.resize(m, 0);
     for i in (0..m).rev() {
-        digits[i] = (x % radix) as u32;
+        out[i] = (x % radix) as u32;
         x /= radix;
     }
-    digits
 }
 
 #[inline]
@@ -112,17 +120,15 @@ fn num_radix_big(radix: &BigUint, x: &[u32]) -> BigUint {
 }
 
 #[inline]
-fn str_m_radix_big(radix: &BigUint, m: usize, mut x: BigUint) -> Vec<u32> {
-    let mut digits = vec![0u32; m];
+fn fill_str_m_radix_big(radix: &BigUint, out: &mut Vec<u32>, m: usize, mut x: BigUint) {
+    out.resize(m, 0);
     for i in (0..m).rev() {
         let rem = &x % radix;
-        digits[i] = rem.to_u32().expect("radix <= 65536, digit always fits u32");
+        out[i] = rem.to_u32().expect("radix <= 65536, digit always fits u32");
         x /= radix;
     }
-    digits
 }
 
-// Serialize a BigUint to exactly `blen` big-endian bytes (right-aligned, zero-padded).
 fn biguint_to_be_bytes_fixed(x: &BigUint, blen: usize) -> Vec<u8> {
     let raw = x.to_bytes_be();
     if raw.len() >= blen {
@@ -138,23 +144,39 @@ fn biguint_to_be_bytes_fixed(x: &BigUint, blen: usize) -> Vec<u8> {
 // Ff1Cipher
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
 pub struct Ff1Cipher {
+    /// Pre-expanded AES cipher — key schedule computed once, reused every call
+    cipher: AesCipher,
+    /// Raw key bytes retained for the key field (needed by key() accessor and
+    /// for equality checks if required by callers)
     key: Vec<u8>,
     radix: u32,
     max_tlen: usize,
 }
 
+impl fmt::Debug for Ff1Cipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ff1Cipher")
+            .field("radix", &self.radix)
+            .field("max_tlen", &self.max_tlen)
+            .finish()
+    }
+}
+
+impl PartialEq for Ff1Cipher {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.radix == other.radix && self.max_tlen == other.max_tlen
+    }
+}
+
 impl Ff1Cipher {
     pub fn new(key: &[u8], radix: u32, max_tlen: usize) -> Result<Self, Ff1Error> {
-        match key.len() {
-            16 | 24 | 32 => {}
-            n => return Err(Ff1Error::InvalidKeyLength(n)),
-        }
         if radix < 2 || radix > 65536 {
             return Err(Ff1Error::InvalidRadix(radix));
         }
+        let cipher = AesCipher::new(key)?;
         Ok(Ff1Cipher {
+            cipher,
             key: key.to_vec(),
             radix,
             max_tlen,
@@ -176,47 +198,38 @@ impl Ff1Cipher {
         if n < 2 {
             return Err(Ff1Error::PlaintextTooShort(n));
         }
-        // NIST SP 800-38G §5.2: minlen >= 2, maxlen <= 2^32.
         if n > u32::MAX as usize {
             return Err(Ff1Error::PlaintextTooLong(n));
         }
         Ok(())
     }
 
-    /// b = ceil(ceil(v * log2(radix)) / 8) — byte width of NUMradix(B)
     fn compute_b(&self, v: usize) -> usize {
         let bits = (v as f64 * (self.radix as f64).log2()).ceil() as usize;
         (bits + 7) / 8
     }
 
-    /// Returns true when the u128 fast path is safe for the given max half-length.
-    /// Safe when radix^m < 2^128, i.e. m <= floor(128 / log2(radix)).
     fn fits_u128(&self, m: usize) -> bool {
         let log2_radix = (self.radix as f64).log2();
         (m as f64) * log2_radix < 128.0
     }
 
     /// CBC-MAC over `data` (must be a multiple of 16 bytes), zero IV.
+    /// Uses the pre-expanded cipher — no key schedule per call.
+    #[inline]
     fn prf(&self, data: &[u8]) -> [u8; 16] {
         debug_assert!(data.len() % 16 == 0);
         let mut r = [0u8; 16];
         for chunk in data.chunks_exact(16) {
-            let mut block = [0u8; 16];
             for i in 0..16 {
-                block[i] = r[i] ^ chunk[i];
+                r[i] ^= chunk[i];
             }
-            r = aes_ecb(&self.key, &block);
+            self.cipher.encrypt_block(&mut r);
         }
         r
     }
 
     /// Compute y = NUM(S[0..d]) for one Feistel round.
-    ///
-    /// Builds PQ = P || T || 0^pad || [i]_1 || num_half_bytes, runs PRF+AES
-    /// to get S, and returns NUM(S[0..d]) as a u128.
-    ///
-    /// y always fits in u128: S is at most 16 bytes (one AES block), so
-    /// NUM(S) <= 2^128 - 1 regardless of radix or plaintext length.
     fn compute_y(
         &self,
         p_block: &[u8; 16],
@@ -225,7 +238,7 @@ impl Ff1Cipher {
         blen: usize,
         d: usize,
         i: usize,
-        num_half_bytes: &[u8], // exactly blen bytes, big-endian
+        num_half_bytes: &[u8],
     ) -> u128 {
         let t = tweak.len();
         let pad_len = (-(t as isize) - blen as isize - 1).rem_euclid(16) as usize;
@@ -233,20 +246,25 @@ impl Ff1Cipher {
         pq.clear();
         pq.extend_from_slice(p_block);
         pq.extend_from_slice(tweak);
-        pq.extend(std::iter::repeat(0u8).take(pad_len));
+
+        // Use resize instead of extend(repeat()) — single memset call
+        let base = pq.len();
+        pq.resize(base + pad_len, 0u8);
+
         pq.push(i as u8);
         pq.extend_from_slice(num_half_bytes);
 
         let rem = pq.len() % 16;
         if rem != 0 {
-            pq.extend(std::iter::repeat(0u8).take(16 - rem));
+            let new_len = pq.len() + (16 - rem);
+            pq.resize(new_len, 0u8);
         }
 
         let r_block = self.prf(pq);
 
-        // S = R || AES(R xor [j]_4) || …  — take first d bytes
         let mut s_bytes = [0u8; 32];
         s_bytes[..16].copy_from_slice(&r_block);
+
         let num_extra = (d + 15) / 16 - 1;
         for j in 1..=num_extra {
             let mut xored = r_block;
@@ -254,10 +272,10 @@ impl Ff1Cipher {
             xored[13] ^= ((j >> 16) & 0xFF) as u8;
             xored[14] ^= ((j >> 8) & 0xFF) as u8;
             xored[15] ^= (j & 0xFF) as u8;
-            s_bytes[16..32].copy_from_slice(&aes_ecb(&self.key, &xored));
+            self.cipher.encrypt_block(&mut xored);
+            s_bytes[16..32].copy_from_slice(&xored);
         }
 
-        // NUM(S[0..d]): d <= 16 always, so right-shift away unused low bytes.
         if d <= 16 {
             let shift = (16 - d) * 8;
             u128::from_be_bytes(s_bytes[..16].try_into().unwrap()) >> shift
@@ -290,9 +308,10 @@ impl Ff1Cipher {
 
     fn cipher_core(&self, x: &[u32], tweak: &[u8], encrypt: bool) -> Vec<u32> {
         let n = x.len();
-        let u = n / 2; // floor(n/2) per NIST SP 800-38G §6 Algorithm 7 Step 1
+        let u = n / 2;
         let v = n - u;
 
+        // Pre-allocate a and b — reused across all 10 rounds via fill_str_m_radix
         let mut a: Vec<u32> = x[..u].to_vec();
         let mut b: Vec<u32> = x[u..].to_vec();
 
@@ -300,7 +319,6 @@ impl Ff1Cipher {
         let d = 4 * ((blen + 3) / 4) + 4;
         let t = tweak.len();
 
-        // P header (NIST Algorithm 7 Step 2)
         let r = self.radix;
         let p_block: [u8; 16] = [
             0x01,
@@ -321,92 +339,148 @@ impl Ff1Cipher {
             (t & 0xFF) as u8,
         ];
 
-        // PQ buffer reused each round
-        let pq_max = 16 + t + 15 + 1 + blen;
-        let mut pq: Vec<u8> = Vec::with_capacity((pq_max + 15) & !15);
+        let pq_cap = (16 + t + 15 + 1 + blen + 15) & !15;
+        let mut pq: Vec<u8> = Vec::with_capacity(pq_cap);
 
-        let iter_range: Vec<usize> = if encrypt {
-            (0..10).collect()
-        } else {
-            (0..10).rev().collect()
-        };
+        // Reusable scratch buffer for str_m_radix output — avoids allocation per round
+        let mut scratch: Vec<u32> = Vec::with_capacity(v.max(u));
 
-        // Choose arithmetic path once based on whether radix^max(u,v) fits u128.
         if self.fits_u128(u.max(v)) {
             // ---- Fast path: pure u128 ----
             let radix = self.radix as u128;
-
-            // b-byte mask: clamps NUMradix to blen bytes (needed when B
-            // temporarily holds u > v digits on odd-n even rounds).
             let b_mask: u128 = if blen >= 16 {
                 u128::MAX
             } else {
                 (1u128 << (blen * 8)) - 1
             };
 
-            for &i in iter_range.iter() {
-                let m = if i % 2 == 0 { u } else { v };
-                let modulus = pow_u128(radix, m);
+            // Direct loop — no iter_range Vec allocation
+            macro_rules! feistel_round {
+                ($i:expr) => {{
+                    let m = if $i % 2 == 0 { u } else { v };
+                    let modulus = pow_u128(radix, m);
 
-                let half = if encrypt { &b } else { &a };
-                let num_half = num_radix_u128(radix, half) & b_mask;
-                let num_half_be = num_half.to_be_bytes();
-                let num_half_bytes = &num_half_be[16 - blen..];
+                    let half = if encrypt { &b } else { &a };
+                    let num_half = num_radix_u128(radix, half) & b_mask;
+                    let num_half_be = num_half.to_be_bytes();
+                    let num_half_bytes = &num_half_be[16 - blen..];
 
-                let y = self.compute_y(&p_block, &mut pq, tweak, blen, d, i, num_half_bytes);
+                    let y = self.compute_y(&p_block, &mut pq, tweak, blen, d, $i, num_half_bytes);
 
-                if encrypt {
-                    let num_a = num_radix_u128(radix, &a);
-                    let c = (num_a + y % modulus) % modulus;
-                    a = std::mem::replace(&mut b, str_m_radix_u128(radix, m, c));
-                } else {
-                    let num_b = num_radix_u128(radix, &b);
-                    let y_mod = y % modulus;
-                    let c = if num_b >= y_mod {
-                        num_b - y_mod
+                    if encrypt {
+                        let num_a = num_radix_u128(radix, &a);
+                        let c = (num_a + y % modulus) % modulus;
+                        fill_str_m_radix_u128(radix, &mut scratch, m, c);
+                        std::mem::swap(&mut a, &mut b);
+                        std::mem::swap(&mut b, &mut scratch);
                     } else {
-                        modulus - (y_mod - num_b)
-                    };
-                    b = std::mem::replace(&mut a, str_m_radix_u128(radix, m, c));
-                }
+                        let num_b = num_radix_u128(radix, &b);
+                        let y_mod = y % modulus;
+                        let c = if num_b >= y_mod {
+                            num_b - y_mod
+                        } else {
+                            modulus - (y_mod - num_b)
+                        };
+                        fill_str_m_radix_u128(radix, &mut scratch, m, c);
+                        std::mem::swap(&mut b, &mut a);
+                        std::mem::swap(&mut a, &mut scratch);
+                    }
+                }};
+            }
+
+            if encrypt {
+                feistel_round!(0);
+                feistel_round!(1);
+                feistel_round!(2);
+                feistel_round!(3);
+                feistel_round!(4);
+                feistel_round!(5);
+                feistel_round!(6);
+                feistel_round!(7);
+                feistel_round!(8);
+                feistel_round!(9);
+            } else {
+                feistel_round!(9);
+                feistel_round!(8);
+                feistel_round!(7);
+                feistel_round!(6);
+                feistel_round!(5);
+                feistel_round!(4);
+                feistel_round!(3);
+                feistel_round!(2);
+                feistel_round!(1);
+                feistel_round!(0);
             }
         } else {
             // ---- BigUint path ----
             let radix = BigUint::from(self.radix);
 
-            for &i in iter_range.iter() {
-                let m = if i % 2 == 0 { u } else { v };
-                let modulus = radix.pow(m as u32);
+            macro_rules! feistel_round_big {
+                ($i:expr) => {{
+                    let m = if $i % 2 == 0 { u } else { v };
+                    let modulus = radix.pow(m as u32);
 
-                let half = if encrypt { &b } else { &a };
-                let num_half = num_radix_big(&radix, half);
-                let num_half_bytes = biguint_to_be_bytes_fixed(&num_half, blen);
+                    let half = if encrypt { &b } else { &a };
+                    let num_half = num_radix_big(&radix, half);
+                    let num_half_bytes = biguint_to_be_bytes_fixed(&num_half, blen);
 
-                let y_u128 = self.compute_y(&p_block, &mut pq, tweak, blen, d, i, &num_half_bytes);
-                let y = BigUint::from(y_u128);
+                    let y_u128 =
+                        self.compute_y(&p_block, &mut pq, tweak, blen, d, $i, &num_half_bytes);
+                    let y = BigUint::from(y_u128);
 
-                if encrypt {
-                    let num_a = num_radix_big(&radix, &a);
-                    let c = (num_a + y % &modulus) % &modulus;
-                    a = std::mem::replace(&mut b, str_m_radix_big(&radix, m, c));
-                } else {
-                    let num_b = num_radix_big(&radix, &b);
-                    let y_mod = y % &modulus;
-                    let c = if num_b >= y_mod {
-                        num_b - y_mod
+                    if encrypt {
+                        let num_a = num_radix_big(&radix, &a);
+                        let c = (num_a + y % &modulus) % &modulus;
+                        fill_str_m_radix_big(&radix, &mut scratch, m, c);
+                        std::mem::swap(&mut a, &mut b);
+                        std::mem::swap(&mut b, &mut scratch);
                     } else {
-                        &modulus - (y_mod - num_b)
-                    };
-                    b = std::mem::replace(&mut a, str_m_radix_big(&radix, m, c));
-                }
+                        let num_b = num_radix_big(&radix, &b);
+                        let y_mod = y % &modulus;
+                        let c = if num_b >= y_mod {
+                            num_b - y_mod
+                        } else {
+                            &modulus - (y_mod - num_b)
+                        };
+                        fill_str_m_radix_big(&radix, &mut scratch, m, c);
+                        std::mem::swap(&mut b, &mut a);
+                        std::mem::swap(&mut a, &mut scratch);
+                    }
+                }};
+            }
+
+            if encrypt {
+                feistel_round_big!(0);
+                feistel_round_big!(1);
+                feistel_round_big!(2);
+                feistel_round_big!(3);
+                feistel_round_big!(4);
+                feistel_round_big!(5);
+                feistel_round_big!(6);
+                feistel_round_big!(7);
+                feistel_round_big!(8);
+                feistel_round_big!(9);
+            } else {
+                feistel_round_big!(9);
+                feistel_round_big!(8);
+                feistel_round_big!(7);
+                feistel_round_big!(6);
+                feistel_round_big!(5);
+                feistel_round_big!(4);
+                feistel_round_big!(3);
+                feistel_round_big!(2);
+                feistel_round_big!(1);
+                feistel_round_big!(0);
             }
         }
 
         let mut result = a;
-        result.extend(b);
+        result.extend_from_slice(&b);
         result
     }
 
+    /// Encrypts a string using the given alphabet.
+    /// Uses a HashMap for O(1) symbol lookup instead of O(radix) linear scan.
     pub fn encrypt_str(
         &self,
         plaintext: &str,
@@ -414,20 +488,28 @@ impl Ff1Cipher {
         alphabet: &str,
     ) -> Result<String, Ff1Error> {
         let chars: Vec<char> = alphabet.chars().collect();
+        let char_to_idx: HashMap<char, u32> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, i as u32))
+            .collect();
+
         let symbols: Result<Vec<u32>, _> = plaintext
             .chars()
             .map(|c| {
-                chars
-                    .iter()
-                    .position(|&a| a == c)
-                    .map(|i| i as u32)
+                char_to_idx
+                    .get(&c)
+                    .copied()
                     .ok_or(Ff1Error::SymbolOutOfRange(c as u32))
             })
             .collect();
+
         let enc = self.encrypt(&symbols?, tweak)?;
         Ok(enc.iter().map(|&i| chars[i as usize]).collect())
     }
 
+    /// Decrypts a string using the given alphabet.
+    /// Uses a HashMap for O(1) symbol lookup instead of O(radix) linear scan.
     pub fn decrypt_str(
         &self,
         ciphertext: &str,
@@ -435,16 +517,22 @@ impl Ff1Cipher {
         alphabet: &str,
     ) -> Result<String, Ff1Error> {
         let chars: Vec<char> = alphabet.chars().collect();
+        let char_to_idx: HashMap<char, u32> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, i as u32))
+            .collect();
+
         let symbols: Result<Vec<u32>, _> = ciphertext
             .chars()
             .map(|c| {
-                chars
-                    .iter()
-                    .position(|&a| a == c)
-                    .map(|i| i as u32)
+                char_to_idx
+                    .get(&c)
+                    .copied()
                     .ok_or(Ff1Error::SymbolOutOfRange(c as u32))
             })
             .collect();
+
         let dec = self.decrypt(&symbols?, tweak)?;
         Ok(dec.iter().map(|&i| chars[i as usize]).collect())
     }
@@ -465,12 +553,6 @@ mod tests {
         s.chars().map(|c| c.to_digit(10).unwrap()).collect()
     }
 
-    fn digit_str(v: &[u32]) -> String {
-        v.iter()
-            .map(|d| char::from_digit(*d, 10).unwrap())
-            .collect()
-    }
-
     const ALPHA36: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 
     fn r36_str(v: &[u32]) -> String {
@@ -479,15 +561,11 @@ mod tests {
             .collect()
     }
 
-    // -------------------------------------------------------------------------
-    // NIST samples 1–3: AES-128
-    // -------------------------------------------------------------------------
-
     #[test]
     fn nist_sample1_aes128_radix10_no_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![2, 4, 3, 3, 4, 7, 7, 4, 8, 4];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![2, 4, 3, 3, 4, 7, 7, 4, 8, 4];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
         assert_eq!(ct, expected, "sample1 encrypt");
@@ -498,8 +576,8 @@ mod tests {
     fn nist_sample2_aes128_radix10_with_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
         let tweak = hex_bytes("39383736353433323130");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![6, 1, 2, 4, 2, 0, 0, 7, 7, 3];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![6, 1, 2, 4, 2, 0, 0, 7, 7, 3];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
         let ct = c.encrypt(&pt, &tweak).unwrap();
         assert_eq!(ct, expected, "sample2 encrypt");
@@ -511,45 +589,35 @@ mod tests {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
         let tweak = hex_bytes("3737373770717273373737");
         let pt: Vec<u32> = (0..19).collect();
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             10, 9, 29, 31, 4, 0, 22, 21, 21, 9, 20, 13, 30, 5, 0, 9, 14, 30, 22,
         ];
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
         let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "sample3 encrypt");
-        assert_eq!(
-            r36_str(&ct),
-            "a9tv40mll9kdu509eum",
-            "sample3 encrypt string"
-        );
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample3 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(r36_str(&ct), "a9tv40mll9kdu509eum");
+        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt);
     }
-
-    // -------------------------------------------------------------------------
-    // NIST samples 4–6: AES-192
-    // -------------------------------------------------------------------------
 
     #[test]
     fn nist_sample4_aes192_radix10_no_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![2, 8, 3, 0, 6, 6, 8, 1, 3, 2];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![2, 8, 3, 0, 6, 6, 8, 1, 3, 2];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "sample4 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "sample4 decrypt");
+        assert_eq!(c.encrypt(&pt, &[]).unwrap(), expected);
+        assert_eq!(c.decrypt(&expected, &[]).unwrap(), pt);
     }
 
     #[test]
     fn nist_sample5_aes192_radix10_with_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
         let tweak = hex_bytes("39383736353433323130");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![2, 4, 9, 6, 6, 5, 5, 5, 4, 9];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![2, 4, 9, 6, 6, 5, 5, 5, 4, 9];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "sample5 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample5 decrypt");
+        assert_eq!(c.encrypt(&pt, &tweak).unwrap(), expected);
+        assert_eq!(c.decrypt(&expected, &tweak).unwrap(), pt);
     }
 
     #[test]
@@ -557,45 +625,35 @@ mod tests {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F");
         let tweak = hex_bytes("3737373770717273373737");
         let pt: Vec<u32> = (0..19).collect();
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             33, 11, 19, 3, 20, 31, 3, 5, 19, 27, 10, 32, 33, 31, 3, 2, 34, 28, 27,
         ];
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
         let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "sample6 encrypt");
-        assert_eq!(
-            r36_str(&ct),
-            "xbj3kv35jrawxv32ysr",
-            "sample6 encrypt string"
-        );
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample6 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(r36_str(&ct), "xbj3kv35jrawxv32ysr");
+        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt);
     }
-
-    // -------------------------------------------------------------------------
-    // NIST samples 7–9: AES-256
-    // -------------------------------------------------------------------------
 
     #[test]
     fn nist_sample7_aes256_radix10_no_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![6, 6, 5, 7, 6, 6, 7, 0, 0, 9];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![6, 6, 5, 7, 6, 6, 7, 0, 0, 9];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "sample7 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "sample7 decrypt");
+        assert_eq!(c.encrypt(&pt, &[]).unwrap(), expected);
+        assert_eq!(c.decrypt(&expected, &[]).unwrap(), pt);
     }
 
     #[test]
     fn nist_sample8_aes256_radix10_with_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let tweak = hex_bytes("39383736353433323130");
-        let pt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let expected: Vec<u32> = vec![1, 0, 0, 1, 6, 2, 3, 4, 6, 3];
+        let pt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let expected = vec![1, 0, 0, 1, 6, 2, 3, 4, 6, 3];
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
-        let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "sample8 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample8 decrypt");
+        assert_eq!(c.encrypt(&pt, &tweak).unwrap(), expected);
+        assert_eq!(c.decrypt(&expected, &tweak).unwrap(), pt);
     }
 
     #[test]
@@ -603,59 +661,34 @@ mod tests {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let tweak = hex_bytes("3737373770717273373737");
         let pt: Vec<u32> = (0..19).collect();
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             33, 28, 8, 10, 0, 10, 35, 17, 2, 10, 31, 34, 10, 21, 34, 35, 30, 32, 13,
         ];
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
         let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "sample9 encrypt");
-        assert_eq!(
-            r36_str(&ct),
-            "xs8a0azh2avyalyzuwd",
-            "sample9 encrypt string"
-        );
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "sample9 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(r36_str(&ct), "xs8a0azh2avyalyzuwd");
+        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt);
     }
-
-    // -------------------------------------------------------------------------
-    // CapitalOne TestLong: AES-256, radix 36, 128 symbols, no tweak.
-    // Ported from https://github.com/capitalone/fpe/blob/master/ff1/ff1_test.go
-    // The original is a round-trip test only — no expected ciphertext is given.
-    // This exercises the BigUint path (radix^64 overflows u128).
-    // -------------------------------------------------------------------------
 
     #[test]
     fn capitalone_long_aes256_radix36_round_trip() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        // plaintext = "xs8a0azh2avyalyzuwd" repeated, truncated to 128 chars
-        // (same string used in TestLong and BenchmarkEncryptLong)
         let pt_str = "xs8a0azh2avyalyzuwdxs8a0azh2avyalyzuwdxs8a0azh2avyalyzuwdxs8a0azh2avyalyzuwdxs8a0azh2avyalyzuwdxs8a0azh2avyalyzuwdxs8a0azh2avyal";
         let pt: Vec<u32> = pt_str
             .chars()
             .map(|c| ALPHA36.find(c).unwrap() as u32)
             .collect();
         assert_eq!(pt.len(), 128);
-
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
-
-        // ciphertext must be a valid radix-36 string of the same length
         assert_eq!(ct.len(), 128);
         assert!(ct.iter().all(|&d| d < 36));
-
-        // decrypt must recover the original plaintext
         assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
     }
 
-    // -------------------------------------------------------------------------
-    // BigUint path boundary and coverage tests
-    // -------------------------------------------------------------------------
-
     #[test]
     fn bigint_boundary_first_crossover_n49_radix36() {
-        // n=49 is the first radix-36 length that requires BigUint:
-        // max(u,v) = 25, and 25 * log2(36) = 129.25 bits > 128.
-        // n=48 (u=v=24, 124 bits) still fits u128; this is the crossover.
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let pt: Vec<u32> = (0..49).map(|i| i % 36).collect();
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
@@ -667,9 +700,6 @@ mod tests {
 
     #[test]
     fn bigint_odd_length_n127_radix36() {
-        // Odd n gives u=63, v=64, so even rounds use m=63 and odd rounds m=64.
-        // This exercises both modulus sizes and asymmetric biguint_to_be_bytes_fixed
-        // serialization on the BigInt path — not covered by the even-n=128 test.
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let pt: Vec<u32> = (0..127).map(|i| i % 36).collect();
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
@@ -681,16 +711,13 @@ mod tests {
 
     #[test]
     fn bigint_with_tweak_n128_radix36() {
-        // All BigInt tests so far use an empty tweak. Verify the tweak bytes
-        // are correctly included in PQ on the BigInt path.
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let tweak = hex_bytes("39383736353433323130");
         let pt: Vec<u32> = (0..128).map(|i| i % 36).collect();
         let c = Ff1Cipher::new_default(&key, 36).unwrap();
         let ct_with = c.encrypt(&pt, &tweak).unwrap();
-        let ct_without = c.encrypt(&pt, &[]).unwrap();
-        // tweak must change the output
-        assert_ne!(ct_with, ct_without);
+        let ct_none = c.encrypt(&pt, &[]).unwrap();
+        assert_ne!(ct_with, ct_none);
         assert_eq!(ct_with.len(), 128);
         assert!(ct_with.iter().all(|&d| d < 36));
         assert_eq!(c.decrypt(&ct_with, &tweak).unwrap(), pt);
@@ -698,8 +725,6 @@ mod tests {
 
     #[test]
     fn minimum_length_n2_radix10() {
-        // n=2 is the minimum permitted length. Exercises the edge of the Feistel
-        // where u=1, v=1, and each half is a single symbol.
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3C");
         let c = Ff1Cipher::new_default(&key, 10).unwrap();
         for first in 0u32..10 {
@@ -713,15 +738,11 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Zcash test vectors — radix 2, AES-256
-    // -------------------------------------------------------------------------
-
     #[test]
     fn zcash_1_aes256_radix2_all_zeros_88bits() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let pt: Vec<u32> = vec![0u32; 88];
-        let expected: Vec<u32> = vec![
+        let pt = vec![0u32; 88];
+        let expected = vec![
             0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1,
             1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1,
             1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1,
@@ -729,20 +750,20 @@ mod tests {
         ];
         let c = Ff1Cipher::new_default(&key, 2).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "zcash_1 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "zcash_1 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
     }
 
     #[test]
     fn zcash_2_aes256_radix2_chained_88bits() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
-        let pt: Vec<u32> = vec![
+        let pt = vec![
             0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1,
             1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1,
             1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1,
             1,
         ];
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0,
             1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0,
             1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0,
@@ -750,15 +771,15 @@ mod tests {
         ];
         let c = Ff1Cipher::new_default(&key, 2).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "zcash_2 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "zcash_2 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
     }
 
     #[test]
     fn zcash_3_aes256_radix2_alternating_no_tweak() {
         let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let pt: Vec<u32> = (0..88).map(|i| i % 2).collect();
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0,
             1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1,
             1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1,
@@ -766,16 +787,17 @@ mod tests {
         ];
         let c = Ff1Cipher::new_default(&key, 2).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "zcash_3 encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "zcash_3 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
     }
 
     #[test]
     fn zcash_4_aes256_radix2_alternating_long_tweak() {
-        let key = hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
+        let key: Vec<u8> =
+            hex_bytes("2B7E151628AED2A6ABF7158809CF4F3CEF4359D8D580AA4F7F036D6F04FC6A94");
         let tweak: Vec<u8> = (0u8..=254).collect();
         let pt: Vec<u32> = (0..88).map(|i| i % 2).collect();
-        let expected: Vec<u32> = vec![
+        let expected = vec![
             0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0,
             0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1,
             1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1,
@@ -783,27 +805,23 @@ mod tests {
         ];
         let c = Ff1Cipher::new(&key, 2, 256).unwrap();
         let ct = c.encrypt(&pt, &tweak).unwrap();
-        assert_eq!(ct, expected, "zcash_4 encrypt");
-        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt, "zcash_4 decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(c.decrypt(&ct, &tweak).unwrap(), pt);
     }
 
     #[test]
     fn specific_aes256_zero_key_radix2_32bits() {
         let key = vec![0u8; 32];
-        let pt: Vec<u32> = vec![0u32; 32];
-        let expected: Vec<u32> = vec![
+        let pt = vec![0u32; 32];
+        let expected = vec![
             1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1,
             0, 0, 0,
         ];
         let c = Ff1Cipher::new_default(&key, 2).unwrap();
         let ct = c.encrypt(&pt, &[]).unwrap();
-        assert_eq!(ct, expected, "zero-key encrypt");
-        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt, "zero-key decrypt");
+        assert_eq!(ct, expected);
+        assert_eq!(c.decrypt(&ct, &[]).unwrap(), pt);
     }
-
-    // -------------------------------------------------------------------------
-    // Error / validation tests
-    // -------------------------------------------------------------------------
 
     #[test]
     fn error_bad_key_length() {
@@ -844,10 +862,6 @@ mod tests {
             Err(Ff1Error::InvalidRadix(1))
         );
     }
-
-    // -------------------------------------------------------------------------
-    // Round-trip smoke tests
-    // -------------------------------------------------------------------------
 
     #[test]
     fn round_trip_radix2() {
