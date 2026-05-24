@@ -304,6 +304,103 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_biguint_degradation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("biguint_degradation");
+
+    // Disable the default measurement time — long inputs take seconds
+    group.measurement_time(std::time::Duration::from_secs(30));
+    group.sample_size(10); // fewer samples for long inputs
+
+    let key = key_256();
+
+    // Lengths around and beyond the u128/BigUint crossover for radix 10
+    // Crossover at radix 10: floor(128 / log2(10)) = floor(128 / 3.32) = 38
+    // So n=38 is last u128, n=39 is first BigUint for radix 10
+    let lengths: &[usize] = &[
+        // u128 fast path
+        10, 20, 30, 38, // BigUint crossover
+        39, 40, // BigUint scaling
+        50, 64, 100, 128, 256, 512, 1024,
+    ];
+
+    for &n in lengths {
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let pt: Vec<u32> = (0..n).map(|i| (i % 10) as u32).collect();
+
+        let path = if n <= 38 { "u128" } else { "biguint" };
+        let label = format!("n{}_{}", n, path);
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(&label, |b| {
+            b.iter(|| cipher.encrypt(black_box(&pt), black_box(&[])))
+        });
+    }
+
+    group.finish();
+}
+
+// Also show radix effect on BigUint crossover point
+fn bench_biguint_crossover_by_radix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("biguint_crossover_by_radix");
+    group.measurement_time(std::time::Duration::from_secs(20));
+    group.sample_size(10);
+
+    let key = key_256();
+
+    // For each radix, show the last u128 length and first BigUint length
+    // Crossover: floor(128 / log2(radix))
+    let cases: &[(u32, usize, usize)] = &[
+        // (radix, last_u128_n, first_biguint_n)
+        (2, 128, 129), // binary: crossover at 128
+        (10, 38, 39),  // decimal: crossover at 38
+        (16, 32, 33),  // hex: crossover at 32
+        (36, 24, 25),  // base36: crossover at 24 (confirmed in earlier bench)
+        (62, 21, 22),  // base62: crossover at 21
+    ];
+
+    for &(radix, last_u128, first_biguint) in cases {
+        let cipher_u128 = Ff1Cipher::new_default(&key, radix).unwrap();
+        let cipher_big = Ff1Cipher::new_default(&key, radix).unwrap();
+        let pt_u128: Vec<u32> = (0..last_u128).map(|i| i as u32 % radix).collect();
+        let pt_big: Vec<u32> = (0..first_biguint).map(|i| i as u32 % radix).collect();
+
+        group.bench_function(&format!("radix{}_n{}_u128", radix, last_u128), |b| {
+            b.iter(|| cipher_u128.encrypt(black_box(&pt_u128), black_box(&[])))
+        });
+
+        group.bench_function(&format!("radix{}_n{}_biguint", radix, first_biguint), |b| {
+            b.iter(|| cipher_big.encrypt(black_box(&pt_big), black_box(&[])))
+        });
+    }
+
+    group.finish();
+}
+
+// Show O(n^2) BigUint scaling visually
+fn bench_biguint_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("biguint_scaling");
+    group.measurement_time(std::time::Duration::from_secs(60));
+    group.sample_size(10);
+
+    let key = key_256();
+
+    // Evenly spaced lengths deep in BigUint territory
+    // These will show the quadratic curve clearly
+    let lengths: &[usize] = &[50, 100, 200, 400, 800, 1600, 3200];
+
+    for &n in lengths {
+        let cipher = Ff1Cipher::new_default(&key, 10).unwrap();
+        let pt: Vec<u32> = (0..n).map(|i| (i % 10) as u32).collect();
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(&format!("n{}", n), |b| {
+            b.iter(|| cipher.encrypt(black_box(&pt), black_box(&[])))
+        });
+    }
+
+    group.finish();
+}
+
 // ── register all benches ──────────────────────────────────────────────────────
 
 criterion_group!(
@@ -315,6 +412,9 @@ criterion_group!(
     bench_tweak_overhead,
     bench_key_sizes,
     bench_radix_comparison,
+    bench_biguint_degradation,
+    bench_biguint_crossover_by_radix,
+    bench_biguint_scaling,
     bench_biguint_path,
     bench_construction,
     bench_throughput,
