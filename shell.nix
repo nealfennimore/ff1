@@ -17,5 +17,6 @@ mkShell {
     wasm-pack
     lld
     rustfmt
+    gnuplot
   ];
 }
