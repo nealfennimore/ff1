@@ -21,6 +21,7 @@ js-sys = "0.3"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 

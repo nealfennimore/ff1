@@ -13,6 +13,7 @@ mkShell {
 
   packages = [
     rustc
+    rustup
     cargo
     wasm-pack
     lld
